@@ -1,16 +1,14 @@
 {
-  "name": "spa-snapshot",
+  "name": "spa-snapshot-proxy",
   "version": "1.0.0",
-  "description": "SPA対応・DOM実行後HTMLを1枚に凍結するスナップショット型no",
-  "type": "module",
   "private": true,
+  "type": "module",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js",
-    "install:browser": "playwright install chromium"
+    "postinstall": "playwright install chromium"
   },
   "dependencies": {
     "express": "^4.19.2",
