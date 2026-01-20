@@ -2,123 +2,171 @@ import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
+/*
+  ===== Render 安定化用 =====
+*/
+let running = 0;
+const MAX_CONCURRENT = 1; // Renderでは必ず1にする
+
+app.use((req, res, next) => {
+  if (running >= MAX_CONCURRENT) {
+    return res.status(429).send("Server busy");
+  }
+  running++;
+  res.on("finish", () => running--);
+  next();
+});
+
+/*
+  ===== メイン =====
+*/
 app.get("/proxy", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("url required");
 
-  const browser = await chromium.launch({
-    args: ["--disable-web-security"]
-  });
+  let browser;
 
-  const context = await browser.newContext({
-    javaScriptEnabled: true,
-    bypassCSP: true
-  });
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process"
+      ]
+    });
 
-  // Service Worker / analytics / beacon 無効化
-  await context.route("**/*", route => {
-    const type = route.request().resourceType();
-    if (["beacon", "websocket"].includes(type)) {
-      route.abort();
-    } else {
-      route.continue();
-    }
-  });
+    const context = await browser.newContext({
+      javaScriptEnabled: true,
+      bypassCSP: true
+    });
 
-  const page = await context.newPage();
-
-  await page.goto(url, { waitUntil: "networkidle" });
-
-  // SPA安定待ち（DOM + fetch 完了）
-  await page.waitForFunction(() => {
-    return (
-      document.readyState === "complete" &&
-      performance.getEntriesByType("resource").length > 10
-    );
-  });
-
-  // 最終保険
-  await page.waitForTimeout(1000);
-
-  const html = await page.evaluate(async () => {
-
-    /* ========= script 完全除去 ========= */
-    document.querySelectorAll("script").forEach(s => s.remove());
-
-    /* ========= CSP破壊 ========= */
-    document
-      .querySelectorAll("meta[http-equiv='Content-Security-Policy']")
-      .forEach(m => m.remove());
-
-    /* ========= CSS統合 ========= */
-    let cssText = "";
-
-    for (const sheet of [...document.styleSheets]) {
-      try {
-        for (const rule of sheet.cssRules) {
-          cssText += rule.cssText + "\n";
-        }
-      } catch {
-        // cross-origin stylesheet
+    // Service Worker / analytics / 無駄通信を遮断
+    await context.route("**/*", route => {
+      const type = route.request().resourceType();
+      if (
+        type === "beacon" ||
+        type === "websocket" ||
+        type === "eventsource"
+      ) {
+        route.abort();
+      } else {
+        route.continue();
       }
-    }
-
-    /* ========= CSS内 url() Base64 ========= */
-    cssText = cssText.replace(/url\((['"]?)(.*?)\1\)/g, (m, q, src) => {
-      if (src.startsWith("data:")) return m;
-      return `url(${new URL(src, location.href).href})`;
     });
 
-    const style = document.createElement("style");
-    style.textContent = cssText;
-    document.head.appendChild(style);
+    const page = await context.newPage();
 
-    document.querySelectorAll("link[rel='stylesheet']").forEach(l => l.remove());
-
-    /* ========= IMG Base64 ========= */
-    for (const img of [...document.images]) {
-      try {
-        const res = await fetch(img.src);
-        const blob = await res.blob();
-
-        const reader = new FileReader();
-        const dataUrl = await new Promise(r => {
-          reader.onload = () => r(reader.result);
-          reader.readAsDataURL(blob);
-        });
-
-        img.src = dataUrl;
-      } catch {}
-    }
-
-    /* ========= SVG 内包 ========= */
-    document.querySelectorAll("img[src$='.svg']").forEach(async img => {
-      try {
-        const txt = await (await fetch(img.src)).text();
-        const div = document.createElement("div");
-        div.innerHTML = txt;
-        img.replaceWith(div.firstChild);
-      } catch {}
+    await page.goto(url, {
+      waitUntil: "networkidle",
+      timeout: 30000
     });
 
-    /* ========= iframe (same-origin) ========= */
-    for (const iframe of [...document.querySelectorAll("iframe")]) {
-      try {
-        const doc = iframe.contentDocument;
-        iframe.replaceWith(doc.documentElement.cloneNode(true));
-      } catch {}
-    }
+    // SPA 安定待ち
+    await page.waitForFunction(() => {
+      return (
+        document.readyState === "complete" &&
+        document.body &&
+        document.body.innerHTML.length > 1000
+      );
+    }, { timeout: 15000 });
 
-    return "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
-  });
+    // 保険
+    await page.waitForTimeout(1000);
 
-  await browser.close();
+    const html = await page.evaluate(async () => {
 
-  res.set("Content-Type", "text/html; charset=utf-8");
-  res.send(html);
+      /* ===== script 完全削除 ===== */
+      document.querySelectorAll("script").forEach(s => s.remove());
+
+      /* ===== CSP 無効化 ===== */
+      document
+        .querySelectorAll("meta[http-equiv='Content-Security-Policy']")
+        .forEach(m => m.remove());
+
+      /* ===== CSS 統合 ===== */
+      let cssText = "";
+
+      for (const sheet of [...document.styleSheets]) {
+        try {
+          for (const rule of sheet.cssRules) {
+            cssText += rule.cssText + "\n";
+          }
+        } catch {
+          // cross-origin は無視
+        }
+      }
+
+      const style = document.createElement("style");
+      style.textContent = cssText;
+      document.head.appendChild(style);
+
+      document
+        .querySelectorAll("link[rel='stylesheet']")
+        .forEach(l => l.remove());
+
+      /* ===== 画像 Base64 ===== */
+      for (const img of [...document.images]) {
+        try {
+          const r = await fetch(img.src);
+          const b = await r.blob();
+          const reader = new FileReader();
+
+          const dataUrl = await new Promise(resolve => {
+            reader.onload = () => resolve(reader.result);
+            reader.readAsDataURL(b);
+          });
+
+          img.src = dataUrl;
+        } catch {}
+      }
+
+      /* ===== SVG 内包 ===== */
+      const svgImgs = [...document.querySelectorAll("img[src$='.svg']")];
+      for (const img of svgImgs) {
+        try {
+          const txt = await (await fetch(img.src)).text();
+          const div = document.createElement("div");
+          div.innerHTML = txt;
+          img.replaceWith(div.firstChild);
+        } catch {}
+      }
+
+      /* ===== iframe（same-origin） ===== */
+      for (const iframe of [...document.querySelectorAll("iframe")]) {
+        try {
+          const doc = iframe.contentDocument;
+          if (doc) {
+            iframe.replaceWith(doc.documentElement.cloneNode(true));
+          }
+        } catch {}
+      }
+
+      return "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+    });
+
+    await browser.close();
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(html);
+
+  } catch (err) {
+    if (browser) await browser.close();
+    res.status(500).send("snapshot failed");
+  }
 });
 
-app.listen(3000, () =>
-  console.log("proxy running http://localhost:3000/proxy?url=...")
-);
+/*
+  ===== Render ヘルスチェック =====
+*/
+app.get("/", (_, res) => {
+  res.send("OK");
+});
+
+app.listen(PORT, () => {
+  console.log(`Render proxy running on ${PORT}`);
+});
